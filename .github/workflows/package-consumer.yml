@@ -1,0 +1,116 @@
+name: Packaged OpenSSL consumer
+run-name: 'Packaged OpenSSL PR 6: 75dba77914e7'
+
+on:
+  push:
+    branches: [bvolpato/native-validation-20261111]
+    paths: [.github/workflows/package-consumer.yml]
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: native-pr-validation
+  cancel-in-progress: false
+
+jobs:
+  consumer:
+    runs-on: macos-26
+    timeout-minutes: 20
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      SOURCE_REF: 75dba77914e7956ca4d22d1af6e5200f1af4a575
+    steps:
+      - name: Check out the exact package source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: bvolpato/openssl-spm
+          ref: 75dba77914e7956ca4d22d1af6e5200f1af4a575
+          persist-credentials: false
+
+      - name: Download the exact native build artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: openssl-native-validation
+          run-id: 43033090396
+          github-token: ${{ github.token }}
+          path: build/native-proof
+
+      - name: Verify source provenance and unpack the actual candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_REF"
+          test "$(head -n 1 build/native-proof/validation/provenance.txt)" = "$SOURCE_REF"
+          expected=$(awk '{print $1}' build/native-proof/validation/sha256.txt)
+          actual=$(shasum -a 256 build/native-proof/libssl.xcframework.zip | awk '{print $1}')
+          test "$actual" = "$expected"
+          mkdir -p build/consumer/BinaryTarget build/consumer/Sources build/validation
+          ditto -x -k build/native-proof/libssl.xcframework.zip build/consumer/BinaryTarget
+          test -d build/consumer/BinaryTarget/OpenSSL.Package.xcframework
+          notices=build/consumer/BinaryTarget/OpenSSL.Package.xcframework/Licenses
+          bash Script/package-notices.sh verify "$notices"
+          cmp LICENSE "$notices/openssl-spm/LICENSE"
+          jq -e --arg source "$SOURCE_REF" '
+            any(.components[]; .name == "openssl-spm" and .revision == $source) and
+            any(.components[]; .name == "OpenSSL" and
+                .revision == "fe686e15d84334b284f883118ed92f64b409b3aa")
+          ' "$notices/manifest.json"
+
+      - name: Build and run the Swift wrapper against the packaged XCFramework
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp -R Source/OpenSSL build/consumer/Sources/OpenSSL
+          mkdir -p build/consumer/Sources/Consumer
+          cat > build/consumer/Package.swift <<'EOF'
+          // swift-tools-version:5.9
+          import PackageDescription
+          let package = Package(
+              name: "PackagedOpenSSLConsumer",
+              platforms: [.macOS(.v10_15)],
+              targets: [
+                  .binaryTarget(name: "libssl", path: "BinaryTarget/OpenSSL.Package.xcframework"),
+                  .target(name: "OpenSSL", dependencies: ["libssl"]),
+                  .executableTarget(name: "Consumer", dependencies: ["OpenSSL"]),
+              ]
+          )
+          EOF
+          cat > build/consumer/Sources/Consumer/main.swift <<'EOF'
+          import OpenSSL
+          guard let context = SSL_CTX_new(TLS_method()) else {
+              fatalError("Packaged TLS context initialization failed")
+          }
+          SSL_CTX_free(context)
+          var digest = [UInt8](repeating: 0, count: Int(EVP_MAX_MD_SIZE))
+          var length: UInt32 = 0
+          let payload = Array("native-validation".utf8)
+          let result = payload.withUnsafeBufferPointer { input in
+              digest.withUnsafeMutableBufferPointer { output in
+                  EVP_Digest(input.baseAddress, input.count,
+                             output.baseAddress,
+                             &length, EVP_sha256(), nil)
+              }
+          }
+          guard result == 1, length == 32 else {
+              fatalError("Packaged EVP SHA-256 digest failed")
+          }
+          print("Packaged OpenSSL module: TLS and EVP succeeded")
+          EOF
+          {
+            printf 'Source commit: %s\nNative build run: 43033090396\n' "$SOURCE_REF"
+            xcodebuild -version
+            swift --version
+            shasum -a 256 build/native-proof/libssl.xcframework.zip
+            swift run --package-path build/consumer Consumer
+          } 2>&1 | tee build/validation/packaged-consumer.log
+
+      - name: Upload packaged consumer evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: openssl-packaged-consumer
+          path: build/validation/
+          if-no-files-found: error
+          retention-days: 14
