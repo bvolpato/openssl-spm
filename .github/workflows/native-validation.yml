@@ -1,0 +1,98 @@
+name: Native PR validation
+
+on:
+  push:
+    branches: [bvolpato/native-validation-20261111]
+    paths: [.github/workflows/native-validation.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-pr-validation
+  cancel-in-progress: false
+
+jobs:
+  native:
+    runs-on: macos-26
+    timeout-minutes: 120
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      SOURCE_REF: 75dba77914e7956ca4d22d1af6e5200f1af4a575
+      OPENSSL_TAG: openssl-3.6.2
+      OPENSSL_REF: fe686e15d84334b284f883118ed92f64b409b3aa
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+    steps:
+      - name: Check out the exact upstream PR head
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: bvolpato/openssl-spm
+          ref: 75dba77914e7956ca4d22d1af6e5200f1af4a575
+          persist-credentials: false
+
+      - name: Prepare build tools and record provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_REF"
+          test -d "$DEVELOPER_DIR"
+          brew install libtool autoconf automake pkgconf coreutils bash jq
+          mkdir -p build/validation
+          {
+            git rev-parse HEAD
+            xcodebuild -version
+            xcodebuild -showsdks
+            printf 'OpenSSL tag: %s\nOpenSSL commit: %s\n' "$OPENSSL_TAG" "$OPENSSL_REF"
+          } | tee build/validation/provenance.txt
+          git clone --filter=blob:none --no-checkout https://github.com/openssl/openssl build/openssl
+          git -C build/openssl checkout "$OPENSSL_TAG"
+          test "$(git -C build/openssl rev-parse HEAD)" = "$OPENSSL_REF"
+
+      - name: Build all five platform groups sequentially
+        shell: bash
+        run: |
+          set -euo pipefail
+          for group in watchos macos ios tvos visionos; do
+            ./Script/build-platform.sh "$OPENSSL_TAG" "$group" ./build/dest 2>&1 |
+              tee "build/validation/build-$group.log"
+            test "$(git -C build/openssl rev-parse HEAD)" = "$OPENSSL_REF"
+          done
+
+      - name: Merge the ten slices and verify matching notice contexts and ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./Script/merge-xcframework.sh ./build/dest ./build/libssl.xcframework.zip 2>&1 |
+            tee build/validation/merge.log
+          shasum -a 256 build/libssl.xcframework.zip | tee build/validation/sha256.txt
+
+      - name: Link and run a native TLS and crypto consumer
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > build/validation/consumer.c <<'EOF'
+          #include <openssl/evp.h>
+          #include <openssl/ssl.h>
+          int main(void) {
+              unsigned char digest[EVP_MAX_MD_SIZE];
+              unsigned int length = 0;
+              SSL_CTX *context = SSL_CTX_new(TLS_method());
+              if (context == NULL) return 1;
+              SSL_CTX_free(context);
+              return EVP_Digest("native-validation", 17, digest, &length, EVP_sha256(), NULL) == 1 && length == 32 ? 0 : 1;
+          }
+          EOF
+          xcrun --sdk macosx clang -I build/dest/macosx/include build/validation/consumer.c \
+            build/dest/macosx/lib/libssl.a -o build/validation/consumer
+          build/validation/consumer
+
+      - name: Upload validation evidence and the test artifact
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: openssl-native-validation
+          path: |
+            build/validation/
+            build/libssl.xcframework.zip
+          if-no-files-found: error
+          retention-days: 14
